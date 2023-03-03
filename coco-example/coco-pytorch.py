@@ -76,9 +76,7 @@ class Unet(nn.Module):
             x = self.decoder_layers[i](x)
             x = torch.cat([skip_connections[i // 2], x], 1)
             x = self.decoder_layers[i + 1](x)
-        # print(x.shape)
         x = torch.sigmoid(self.final_layer(x))
-        # x = nn.Conv2d(self.depth_num_channels[0], self.num_output_channels, 1)(x)
 
         return x
 
@@ -172,7 +170,6 @@ def get_mask(image, annotation, coco_annotations):
     image = transforms.Resize((256, 256))(image)
     image = normalization(image)
     for i in range(len(annotation)):
-#         mask = np.maximum(coco.annToMask(annotation[i])*annotation[i]["category_id"], mask)
         mask = torch.maximum(torch.from_numpy(coco_annotations.annToMask(annotation[i])), mask)
     mask = mask[None,:,:]
     mask = transforms.functional.crop(mask, *params)
