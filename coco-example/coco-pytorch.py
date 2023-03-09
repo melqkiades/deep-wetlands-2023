@@ -5,10 +5,13 @@ from pycocotools.coco import COCO
 import wandb
 from matplotlib import pyplot as plt
 import numpy as np
-from torchvision import transforms
+import skimage.io as io
+from pycocotools import mask
+from torchvision import transforms, datasets
 from functools import partial
 from time import time
 from PIL import Image
+import io
 
 
 class Unet(nn.Module):
@@ -133,58 +136,46 @@ def fig2img(fig):
     return img
 
 
-input_dim = 256
-num_input_channels = 3
-num_output_channels = 1
-num_first_level_channels = 64
-depth = 5
-model = Unet(input_dim, num_input_channels, num_output_channels, num_first_level_channels, depth, padding=True)
-lr = 0.003
-optimizer = optim.Adam(model.parameters(), lr=lr)
-loss_func = DiceLoss()
-batch_size = 32
-num_workers = 8
-
-wandb.login(key='####')
-wandb.init(project="coco-unet", config={
-        "learning_rate": lr,
-        "batch_size": batch_size,
-        "num_workers": num_workers,
-    })
-
-
-
-coco_train = COCO("/mimer/NOBACKUP/Datasets/Microsoft-COCO/annotations/instances_train2017.json")
-coco_val = COCO("/mimer/NOBACKUP/Datasets/Microsoft-COCO/annotations/instances_val2017.json")
-
-
-
-random_crop = transforms.RandomResizedCrop(256)
-normalization = transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
-
-def get_mask(image, annotation, coco_annotations):
+def get_mask(image, annotation, coco_annotations, augment):
     image = transforms.ToTensor()(image)
     mask = torch.zeros((image.shape[1],image.shape[2]))
-    params = random_crop.get_params(image, scale=(0.5, 1.0), ratio=(0.75, 1.33))
-    image = transforms.functional.crop(image, *params)
+    if augment:
+        params = random_crop.get_params(image, scale=(0.5, 1.0), ratio=(0.75, 1.33))
+        image = transforms.functional.crop(image, *params)
     image = transforms.Resize((256, 256))(image)
     image = normalization(image)
     for i in range(len(annotation)):
+#         mask = np.maximum(coco.annToMask(annotation[i])*annotation[i]["category_id"], mask)
         mask = torch.maximum(torch.from_numpy(coco_annotations.annToMask(annotation[i])), mask)
     mask = mask[None,:,:]
-    mask = transforms.functional.crop(mask, *params)
+    if augment:
+        mask = transforms.functional.crop(mask, *params)
     mask = transforms.Resize((256, 256))(mask)
     return image, mask
 
 
+invTrans = transforms.Compose([ transforms.Normalize(mean = [ 0., 0., 0. ],
+                                                     std = [ 1/0.229, 1/0.224, 1/0.225 ]),
+                                transforms.Normalize(mean = [ -0.485, -0.456, -0.406 ],
+                                                     std = [ 1., 1., 1. ]),
+                               ])
 
+input_dim = 256
+num_input_channels = 3
+num_output_channels = 1
+batch_size = 32
+num_workers = 8
 
-from torchvision import transforms, datasets
+coco_train = COCO("/mimer/NOBACKUP/Datasets/Microsoft-COCO/annotations/instances_train2017.json")
+coco_val = COCO("/mimer/NOBACKUP/Datasets/Microsoft-COCO/annotations/instances_val2017.json")
+
+random_crop = transforms.RandomResizedCrop(256)
+normalization = transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+
 datasets = {'train':datasets.CocoDetection("/mimer/NOBACKUP/Datasets/Microsoft-COCO/train2017",
-                                 "/mimer/NOBACKUP/Datasets/Microsoft-COCO/annotations/instances_train2017.json",transforms=partial(get_mask, coco_annotations=coco_train)),
+                                 "/mimer/NOBACKUP/Datasets/Microsoft-COCO/annotations/instances_train2017.json",transforms=partial(get_mask, coco_annotations=coco_train, augment=True)),
             'val':datasets.CocoDetection("/mimer/NOBACKUP/Datasets/Microsoft-COCO/val2017",
-                                 "/mimer/NOBACKUP/Datasets/Microsoft-COCO/annotations/instances_val2017.json",transforms=partial(get_mask, coco_annotations=coco_val))}
-
+                                 "/mimer/NOBACKUP/Datasets/Microsoft-COCO/annotations/instances_val2017.json",transforms=partial(get_mask, coco_annotations=coco_val, augment=False))}
 
 dataloaders = {'train':DataLoader(datasets['train'], batch_size=batch_size, shuffle=True, num_workers=num_workers),
                'val':DataLoader(datasets['val'], batch_size=batch_size, shuffle=False, num_workers=num_workers)}
@@ -245,9 +236,10 @@ def evaluate(model, dataloader, criterion, device, plot_result=True):
             iou_sum += intersection_over_union(model_seg, true_seg)
 
     if plot_result:
-        images = np.minimum(np.maximum(image.cpu().numpy(), 0), 1)
-        true_segs = np.minimum(np.maximum(true_seg.cpu().numpy(), 0), 1)
-        model_segs = np.minimum(np.maximum(model_seg.cpu().numpy(), 0), 1)
+        images = invTrans(image.cpu()).numpy()
+        true_segs = true_seg.cpu().numpy()
+        model_segs = (model_seg.cpu().numpy() > 0.5).astype(float)
+
         fig, axs = plt.subplots(5, 3, figsize=(15, 15))
         for i in range(5):
             image = np.transpose(images[i], [1, 2, 0])
@@ -260,7 +252,7 @@ def evaluate(model, dataloader, criterion, device, plot_result=True):
             axs[i, 2].imshow(model_seg)
             axs[i, 2].set_title('Predicted segmentation map')
         fig.tight_layout()
-        plt.show()
+        fig.canvas.draw()
         wandb_fig = plt.gcf()
         wandb_img = wandb.Image(fig2img(wandb_fig))
         
@@ -276,13 +268,30 @@ def evaluate(model, dataloader, criterion, device, plot_result=True):
     return metrics
 
 
+wandb.login(key='####')
+num_first_level_channels = 64
+depth = 4
+model = Unet(input_dim, num_input_channels, num_output_channels, num_first_level_channels, depth, padding=True)
 model.to(device)
+lr = 0.0004863
+weight_decay = 0.0003204
+optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+loss_func = DiceLoss()
+
+
+wandb.init(project="coco-unet", config={
+        "learning_rate": lr,
+        "weight_decay": weight_decay,
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "depth":depth,
+    })
 n_epochs = 100
 for epoch in range(1, n_epochs + 1):
     starttime = time()
     print("\nEpoch {}/{}".format(epoch, n_epochs))
     print("-" * 10)
-    
+
     train_metrics = train(
         model,
         dataloaders["train"],
@@ -301,9 +310,8 @@ for epoch in range(1, n_epochs + 1):
     )
     valtime = time()
     print(f'Val duration: {valtime - traintime} s.')
-    metrics = {
-        **train_metrics, **val_metrics}
-    
+    metrics = {**train_metrics,  **val_metrics}
+
     torch.save({
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
