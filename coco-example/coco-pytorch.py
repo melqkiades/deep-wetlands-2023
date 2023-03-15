@@ -5,8 +5,6 @@ from pycocotools.coco import COCO
 import wandb
 from matplotlib import pyplot as plt
 import numpy as np
-import skimage.io as io
-from pycocotools import mask
 from torchvision import transforms, datasets
 from functools import partial
 from time import time
@@ -79,7 +77,7 @@ class Unet(nn.Module):
             x = self.decoder_layers[i](x)
             x = torch.cat([skip_connections[i // 2], x], 1)
             x = self.decoder_layers[i + 1](x)
-        x = torch.sigmoid(self.final_layer(x))
+        x = torch.nn.Softmax(self.final_layer(x))
 
         return x
 
@@ -128,7 +126,6 @@ def intersection_over_union(y_pred, y_true):
 
 def fig2img(fig):
     """Convert a Matplotlib figure to a PIL Image and return it"""
-    import io
     buf = io.BytesIO()
     fig.savefig(buf)
     buf.seek(0)
