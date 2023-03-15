@@ -77,7 +77,7 @@ class Unet(nn.Module):
             x = self.decoder_layers[i](x)
             x = torch.cat([skip_connections[i // 2], x], 1)
             x = self.decoder_layers[i + 1](x)
-        x = torch.nn.Softmax(self.final_layer(x))
+        x = torch.nn.Softmax(dim=1)(self.final_layer(x))
 
         return x
 
