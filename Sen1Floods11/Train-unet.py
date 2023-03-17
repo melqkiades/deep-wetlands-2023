@@ -265,7 +265,7 @@ criterion = nn.CrossEntropyLoss(weight=torch.tensor([1,8]).float(), ignore_index
 optimizer = torch.optim.AdamW(model.parameters(),lr=lr)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, len(train_loader) * 10, T_mult=2, eta_min=0, last_epoch=-1)
 
-wandb.login(key='63301dac214370d848fc09c6f7ed50b730a82ecc')
+wandb.login(key='####')
 wandb.init(project="Sen1Floods11-unet", config={
            "learning_rate": lr,
            "batch_size": batch_size,
