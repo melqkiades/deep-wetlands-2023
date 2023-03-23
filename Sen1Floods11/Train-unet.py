@@ -1,174 +1,251 @@
+# The following is an example of how to utilize our Sen1Floods11 dataset for training a FCNN. In this example, we train
+# and validate on hand-labeled chips of flood events. However, our dataset includes several other options that are
+# detailed in the README. To replace the dataset, as outlined further below, simply replace the train, test, and
+# validation split csv's, and download the corresponding dataset.
+import sys
+
+# Define model training hyperparameters
+lr = 5e-4
+max_epochs = 220
+runname = "Sen1Floods11"
+use_vv = True
+use_unet = False
+dataset = "flood_hand-labeled"
+batch_size = 16
+num_workers = 8
+
+if use_vv == False and use_unet == False:
+    print("Default model requires vv.")
+    sys.exit()
+
+# Define functions to process and augment training and testing images
 import torch
 from torchvision import transforms
 import torchvision.transforms.functional as F
 import random
 from PIL import Image
-from tqdm import tqdm
 import wandb
 import matplotlib.pyplot as plt
 import io
+from matplotlib.colors import ListedColormap
+
+
+def fig2img(fig):
+    """Convert a Matplotlib figure to a PIL Image and return it"""
+    buf = io.BytesIO()
+    fig.savefig(buf)
+    buf.seek(0)
+    img = Image.open(buf)
+    return img
 
 
 class InMemoryDataset(torch.utils.data.Dataset):
-  
-  def __init__(self, data_list, preprocess_func):
-    self.data_list = data_list
-    self.preprocess_func = preprocess_func
-  
-  def __getitem__(self, i):
-    return self.preprocess_func(self.data_list[i])
-  
-  def __len__(self):
-    return len(self.data_list)
+
+    def __init__(self, data_list, preprocess_func, use_vv=False):
+        self.data_list = data_list
+        self.preprocess_func = preprocess_func
+        self.use_vv = use_vv
+
+    def __getitem__(self, i):
+        return self.preprocess_func(self.data_list[i], self.use_vv)
+
+    def __len__(self):
+        return len(self.data_list)
 
 
-def processAndAugment(data):
-  (x,y) = data
-  im, label = x.copy(), y.copy()
+def processAndAugment(data, use_vv=False):
+    (x, y) = data
+    im, label = x.copy(), y.copy()
 
-  # convert to PIL for easier transforms
-  im2 = Image.fromarray(im[1])
-  label = Image.fromarray(label.squeeze())
+    # convert to PIL for easier transforms
+    if use_vv:
+        im_vv = Image.fromarray(im[0])
+        im_vh = Image.fromarray(im[1])
+    else:
+        im_vh = Image.fromarray(im[0])
+    label = Image.fromarray(label.squeeze())
 
-  # Get params for random transforms
-  i, j, h, w = transforms.RandomCrop.get_params(im2, (256, 256))
-  
-  im2 = F.crop(im2, i, j, h, w)
-  label = F.crop(label, i, j, h, w)
-  if random.random() > 0.5:
-    im2 = F.hflip(im2)
-    label = F.hflip(label)
-  if random.random() > 0.5:
-    im2 = F.vflip(im2)
-    label = F.vflip(label)
-  
-  norm = transforms.Normalize([0.5235], [0.1102])
-  im = transforms.ToTensor()(im2)
-  im = norm(im)
-  label = transforms.ToTensor()(label).squeeze()
-  if torch.sum(label.gt(.003) * label.lt(.004)):
-    label *= 255
-#   label = label.round()
+    # Get params for random transforms
+    i, j, h, w = transforms.RandomCrop.get_params(im_vh, (256, 256))
 
-  return im, label
+    if use_vv:
+        im_vv = F.crop(im_vv, i, j, h, w)
+    im_vh = F.crop(im_vh, i, j, h, w)
+    label = F.crop(label, i, j, h, w)
+    if random.random() > 0.5:
+        if use_vv:
+            im_vv = F.hflip(im_vv)
+        im_vh = F.hflip(im_vh)
+        label = F.hflip(label)
+    if random.random() > 0.5:
+        if use_vv:
+            im_vv = F.vflip(im_vv)
+        im_vh = F.vflip(im_vh)
+        label = F.vflip(label)
+    if use_vv:
+        norm = transforms.Normalize([0.6851, 0.5235], [0.0820, 0.1102])
+        im = torch.stack([transforms.ToTensor()(im_vv).squeeze(), transforms.ToTensor()(im_vh).squeeze()])
+    else:
+        norm = transforms.Normalize([0.5235], [0.1102])
+        im = transforms.ToTensor()(im_vh)
+    im = norm(im)
+    label = transforms.ToTensor()(label).squeeze()
+    if torch.sum(label.gt(.003) * label.lt(.004)):
+        label *= 255
+    #   label = label.round()
+
+    return im, label
 
 
-def processTestIm(data):
-  (x,y) = data
-  im,label = x.copy(), y.copy()
-  norm = transforms.Normalize([0.5235], [0.1102])
+def processTestIm(data, use_vv=False):
+    (x, y) = data
+    im, label = x.copy(), y.copy()
+    if use_vv:
+        norm = transforms.Normalize([0.6851, 0.5235], [0.0820, 0.1102])
+    else:
+        transforms.Normalize([0.5235], [0.1102])
 
-  # convert to PIL for easier transforms
-  im_c2 = Image.fromarray(im[1]).resize((512,512))
-  label = Image.fromarray(label.squeeze()).resize((512,512))
+    # convert to PIL for easier transforms
+    if use_vv:
+        im_vv = Image.fromarray(im[0]).resize((512, 512))
+        im_vh = Image.fromarray(im[1]).resize((512, 512))
+    else:
+        im_vh = Image.fromarray(im[0]).resize((512, 512))
+    label = Image.fromarray(label.squeeze()).resize((512, 512))
 
-  im_c2s = [F.crop(im_c2, 0, 0, 256, 256), F.crop(im_c2, 0, 256, 256, 256),
-            F.crop(im_c2, 256, 0, 256, 256), F.crop(im_c2, 256, 256, 256, 256)]
-  labels = [F.crop(label, 0, 0, 256, 256), F.crop(label, 0, 256, 256, 256),
-            F.crop(label, 256, 0, 256, 256), F.crop(label, 256, 256, 256, 256)]
+    if use_vv:
+        im_vvs = [F.crop(im_vv, 0, 0, 256, 256), F.crop(im_vv, 0, 256, 256, 256),
+                  F.crop(im_vv, 256, 0, 256, 256), F.crop(im_vv, 256, 256, 256, 256)]
+    im_vhs = [F.crop(im_vh, 0, 0, 256, 256), F.crop(im_vh, 0, 256, 256, 256),
+              F.crop(im_vh, 256, 0, 256, 256), F.crop(im_vh, 256, 256, 256, 256)]
+    labels = [F.crop(label, 0, 0, 256, 256), F.crop(label, 0, 256, 256, 256),
+              F.crop(label, 256, 0, 256, 256), F.crop(label, 256, 256, 256, 256)]
 
-  ims = [transforms.ToTensor()(x) for x in im_c2s]
+    if use_vv:
+        ims = [torch.stack((transforms.ToTensor()(x).squeeze(),
+                            transforms.ToTensor()(y).squeeze()))
+               for (x, y) in zip(im_vvs, im_vhs)]
+    else:
+        ims = [transforms.ToTensor()(x) for x in im_vhs]
 
-  ims = [norm(im) for im in ims]
-  ims = torch.stack(ims)
+    ims = [norm(im) for im in ims]
+    ims = torch.stack(ims)
 
-  labels = [(transforms.ToTensor()(label).squeeze()) for label in labels]
-  labels = torch.stack(labels)
+    labels = [(transforms.ToTensor()(label).squeeze()) for label in labels]
+    labels = torch.stack(labels)
 
-  if torch.sum(labels.gt(.003) * labels.lt(.004)):
-    labels *= 255
+    if torch.sum(labels.gt(.003) * labels.lt(.004)):
+        labels *= 255
+    #   labels = labels.round()
 
-  return ims, labels
+    return ims, labels
 
+
+# Load *flood water* train, test, and validation data from splits. In this example, this is the data we will use to
+# train our model.
+from time import time
 import csv
 import os
 import numpy as np
 import rasterio
 
+
 def getArrFlood(fname):
-  return rasterio.open(fname).read()
-
-def download_flood_water_data_from_list(l):
-  i = 0
-  tot_nan = 0
-  tot_good = 0
-  flood_data = []
-  for (im_fname, mask_fname) in l:
-    if not os.path.exists(os.path.join("files/", im_fname)):
-      continue
-    arr_x = np.nan_to_num(getArrFlood(os.path.join("files/", im_fname)))
-    arr_y = getArrFlood(os.path.join("files/", mask_fname))
-    arr_y[arr_y == -1] = 255
-
-    arr_x = np.clip(arr_x, -50, 1)
-    arr_x = (arr_x + 50) / 51
-      
-    # if i % 100 == 0:
-    #   print(im_fname, mask_fname)
-    i += 1
-    flood_data.append((arr_x,arr_y))
-
-  return flood_data
-
-def load_flood_train_data(input_root, label_root):
-  fname = "D:\\Downloads\\flood\\v1.1\splits\\flood_handlabeled\\flood_train_data.csv"
-  training_files = []
-  with open(fname) as f:
-    for line in csv.reader(f):
-      training_files.append(tuple((input_root+line[0], label_root+line[1])))
-
-  return download_flood_water_data_from_list(training_files)
-
-def load_flood_valid_data(input_root, label_root):
-  fname = "D:\\Downloads\\flood\\v1.1\splits\\flood_handlabeled\\flood_valid_data.csv"
-  validation_files = []
-  with open(fname) as f:
-    for line in csv.reader(f):
-      validation_files.append(tuple((input_root+line[0], label_root+line[1])))
-
-  return download_flood_water_data_from_list(validation_files)
-
-def load_flood_test_data(input_root, label_root):
-  fname = "D:\\Downloads\\flood\\v1.1\splits\\flood_handlabeled\\flood_test_data.csv"
-  testing_files = []
-  with open(fname) as f:
-    for line in csv.reader(f):
-      testing_files.append(tuple((input_root+line[0], label_root+line[1])))
-  
-  return download_flood_water_data_from_list(testing_files)
+    return rasterio.open(fname).read()
 
 
+def download_flood_water_data_from_list(l, use_vv):
+    i = 0
+    tot_nan = 0
+    tot_good = 0
+    flood_data = []
+    for (im_fname, mask_fname) in l:
+        if not os.path.exists(os.path.join("files/", im_fname)):
+            continue
+        arr_x = np.nan_to_num(getArrFlood(os.path.join("files/", im_fname)))
+        if not use_vv:
+            arr_x = arr_x[1:]
+        arr_y = getArrFlood(os.path.join("files/", mask_fname))
+        arr_y[arr_y == -1] = 255
+
+        arr_x = np.clip(arr_x, -50, 1)
+        arr_x = (arr_x + 50) / 51
+
+        # if i % 100 == 0:
+        #   print(im_fname, mask_fname)
+        i += 1
+        flood_data.append((arr_x, arr_y))
+
+    return flood_data
 
 
-train_data = load_flood_train_data("D:\\Downloads\\flood\\v1.1\\data\\flood_events\\HandLabeled\\S1Hand\\",
-                                   "D:\\Downloads\\flood\\v1.1\\data\\flood_events\\HandLabeled\\LabelHand\\")
-train_dataset = InMemoryDataset(train_data, processAndAugment)
+def load_flood_data(input_root, label_root, csv_name, use_vv=True):
+    files = []
+    with open(csv_name) as f:
+        for line in csv.reader(f):
+            files.append(tuple((input_root + line[0], label_root + line[1])))
 
-valid_data = load_flood_valid_data("D:\\Downloads\\flood\\v1.1\\data\\flood_events\\HandLabeled\\S1Hand\\",
-                                   "D:\\Downloads\\flood\\v1.1\\data\\flood_events\\HandLabeled\\LabelHand\\")
-valid_dataset = InMemoryDataset(valid_data, processTestIm)
-
-
-train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=16, shuffle=True, sampler=None,
-                  batch_sampler=None, num_workers=0, collate_fn=None,
-                  pin_memory=True, drop_last=False, timeout=0,
-                  worker_init_fn=None)
-train_iter = iter(train_loader)
-
-valid_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=16, shuffle=True, sampler=None,
-                  batch_sampler=None, num_workers=0, collate_fn=lambda x: (torch.cat([a[0] for a in x], 0), torch.cat([a[1] for a in x], 0)),
-                  pin_memory=True, drop_last=False, timeout=0,
-                  worker_init_fn=None)
-valid_iter = iter(valid_loader)
+    return download_flood_water_data_from_list(files, use_vv)
 
 
+if use_vv:
+    unnorm = transforms.Compose([transforms.Normalize([0., 0.], [1 / 0.0820, 1 / 0.1102]),
+                                 transforms.Normalize([-0.6851, -0.5235], [1., 1.])])
+else:
+    unnorm = transforms.Compose([transforms.Normalize([0.], [1 / 0.1102]),
+                                 transforms.Normalize([-0.5235], [1.])])
+
+
+# Load training data and validation data. Note that here, we have chosen to train and validate our model on flood data.
+# However, you can simply replace the load function call with one of the options defined above to load a different
+# dataset.
+def get_dataloaders(dataset, use_vv, batch_size, num_workers):
+    if dataset == "flood_hand-labeled":
+        input_root = "/mimer/NOBACKUP/groups/deep-wetlands-2023/iakovidis_data/Sen1Floods11/data/flood_events/HandLabeled/S1Hand/"
+        label_root = "/mimer/NOBACKUP/groups/deep-wetlands-2023/iakovidis_data/Sen1Floods11/data/flood_events/HandLabeled/LabelHand/"
+        train_csv_name = "/mimer/NOBACKUP/groups/deep-wetlands-2023/iakovidis_data/Sen1Floods11/splits/flood_handlabeled/flood_train_data.csv"
+        valid_csv_name = "/mimer/NOBACKUP/groups/deep-wetlands-2023/iakovidis_data/Sen1Floods11/splits/flood_handlabeled/flood_valid_data.csv"
+        test_csv_name = "/mimer/NOBACKUP/groups/deep-wetlands-2023/iakovidis_data/Sen1Floods11/splits/flood_handlabeled/flood_test_data.csv"
+        bolivia_test_csv_name = "/mimer/NOBACKUP/groups/deep-wetlands-2023/iakovidis_data/Sen1Floods11/splits/flood_handlabeled/flood_bolivia_data.csv"
+    train_dataloader = create_dataloader(input_root, label_root, train_csv_name, True, use_vv, batch_size, num_workers)
+    valid_dataloader = create_dataloader(input_root, label_root, valid_csv_name, False, use_vv, batch_size // 4,
+                                         num_workers)
+    test_dataloader = create_dataloader(input_root, label_root, test_csv_name, False, use_vv, batch_size // 4,
+                                        num_workers)
+    bolivia_test_dataloader = create_dataloader(input_root, label_root, bolivia_test_csv_name, False, use_vv,
+                                                batch_size // 4, num_workers)
+    return train_dataloader, valid_dataloader, test_dataloader, bolivia_test_dataloader
+
+
+def create_dataloader(input_root, label_root, csv_name, augment, use_vv, batch_size, num_workers):
+    data = load_flood_data(input_root, label_root, csv_name, use_vv)
+    if augment:
+        dataset = InMemoryDataset(data, processAndAugment, use_vv)
+        collate_fn = None
+    else:
+        dataset = InMemoryDataset(data, processTestIm, use_vv)
+        collate_fn = lambda x: (torch.cat([a[0] for a in x], 0), torch.cat([a[1] for a in x], 0))
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True, sampler=None,
+                                             batch_sampler=None, num_workers=num_workers, collate_fn=collate_fn,
+                                             pin_memory=True, drop_last=False, timeout=0,
+                                             worker_init_fn=None)
+    return dataloader
+
+
+train_loader, valid_loader, test_loader, bolivia_test_loader = get_dataloaders(dataset, use_vv, batch_size, num_workers)
+
+# Define the network. For our purposes, we use ResNet50. However, if you wish to test a different model framework,
+# optimizer, or loss function you can simply replace those here.
+import torch
+import torchvision.models as models
 import torch.nn as nn
+
 
 class Unet(nn.Module):
 
     def __init__(self, input_dim=572, num_input_channels=4, num_output_channels=2, num_first_level_channels=64,
-                depth=5, conv_kernel_size=3, conv_stride=1, max_pool_size=2,
-                up_conv_kernel_size=2, up_conv_stride=2, padding=False):
+                 depth=5, conv_kernel_size=3, conv_stride=1, max_pool_size=2, up_conv_kernel_size=2, up_conv_stride=2,
+                 padding=False, conv_init=None):
         super().__init__()
 
         self.input_dim = input_dim
@@ -182,17 +259,22 @@ class Unet(nn.Module):
         self.up_conv_kernel_size = up_conv_kernel_size
         self.up_conv_stride = up_conv_stride
         self.padding = padding
+        self.conv_init = conv_init
         self.depth_num_channels = [self.num_first_level_channels]
-        for i in range(self.depth-1):
-            self.depth_num_channels.append(self.depth_num_channels[-1]*2)
+        for i in range(self.depth - 1):
+            self.depth_num_channels.append(self.depth_num_channels[-1] * 2)
         if not self.padding:
-            self.encoder_skip_dims = [self.input_dim-2*(self.conv_kernel_size-1)]
+            self.encoder_skip_dims = [self.input_dim - 2 * (self.conv_kernel_size - 1)]
             for i in range(1, len(self.depth_num_channels) - 1):
-                self.encoder_skip_dims.append(self.encoder_skip_dims[-1] // self.max_pool_size - 2 * (self.conv_kernel_size - 1))
-            self.decoder_skip_dims = [(self.encoder_skip_dims[-1] // self.max_pool_size - 2 * (self.conv_kernel_size - 1)) * 2]
+                self.encoder_skip_dims.append(
+                    self.encoder_skip_dims[-1] // self.max_pool_size - 2 * (self.conv_kernel_size - 1))
+            self.decoder_skip_dims = [
+                (self.encoder_skip_dims[-1] // self.max_pool_size - 2 * (self.conv_kernel_size - 1)) * 2]
             for i in range(1, len(self.depth_num_channels) - 1):
-                self.decoder_skip_dims.insert(0, (self.decoder_skip_dims[0] - 2 * (self.conv_kernel_size - 1)) * self.up_conv_stride)
-        self.encoder_layers = nn.ModuleList([self.unet_block(num_input_channels, self.depth_num_channels[0]), nn.MaxPool2d(2)])
+                self.decoder_skip_dims.insert(0, (
+                            self.decoder_skip_dims[0] - 2 * (self.conv_kernel_size - 1)) * self.up_conv_stride)
+        self.encoder_layers = nn.ModuleList(
+            [self.unet_block(num_input_channels, self.depth_num_channels[0]), nn.MaxPool2d(2)])
         for i in range(len(self.depth_num_channels) - 2):
             self.encoder_layers.append(
                 self.unet_block(self.depth_num_channels[i], self.depth_num_channels[i + 1]))
@@ -231,131 +313,175 @@ class Unet(nn.Module):
             x = self.decoder_layers[i + 1](x)
         x = torch.nn.Softmax(dim=1)(self.final_layer(x))
 
-        return x
+        return {"out": x}
 
     def conv_block(self, num_in_channels, num_out_channels):
         if not self.padding:
             padding_arg = 'valid'
         else:
             padding_arg = 'same'
-        conv_block = nn.Sequential(nn.Conv2d(num_in_channels, num_out_channels, self.conv_kernel_size, self.conv_stride,
-                                             padding=padding_arg),
+        conv_layer = nn.Conv2d(num_in_channels, num_out_channels, self.conv_kernel_size, self.conv_stride,
+                               padding=padding_arg)
+        if self.conv_init == 'He':
+            torch.nn.init.kaiming_uniform_(conv_layer.weight)
+        conv_block = nn.Sequential(conv_layer,
                                    nn.BatchNorm2d(num_out_channels),
                                    nn.ReLU())
         return conv_block
-
 
     def unet_block(self, num_in_channels, num_out_channels):
         unet_block = nn.Sequential(self.conv_block(num_in_channels, num_out_channels),
                                    self.conv_block(num_out_channels, num_out_channels))
         return unet_block
 
-input_dim = 256
-num_input_channels = 1
-num_output_channels = 2
-batch_size = 32
-num_workers = 8
-num_first_level_channels = 64
-depth = 4
-lr = 0.001
 
-model = Unet(input_dim, num_input_channels, num_output_channels, num_first_level_channels, depth, padding=True)
+if use_unet:
+    input_dim = 256
+    if use_vv:
+        num_input_channels = 2
+    else:
+        num_input_channels = 1
+    num_output_channels = 2
+    num_first_level_channels = 64
+    depth = 4
 
-criterion = nn.CrossEntropyLoss(weight=torch.tensor([1,8]).float(), ignore_index=255)
-optimizer = torch.optim.AdamW(model.parameters(),lr=lr)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, len(train_loader) * 10, T_mult=2, eta_min=0, last_epoch=-1)
+    net = Unet(input_dim, num_input_channels, num_output_channels, num_first_level_channels, depth, padding=True)
+else:
+    net = models.segmentation.fcn_resnet50(pretrained=False, num_classes=2, pretrained_backbone=False)
+    net.backbone.conv1 = nn.Conv2d(2, 64, kernel_size=7, stride=2, padding=3, bias=False)
 
+criterion = nn.CrossEntropyLoss(weight=torch.tensor([1, 8]).float().cuda(), ignore_index=255)
+optimizer = torch.optim.AdamW(net.parameters(), lr=lr)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, len(train_loader) * 10, T_mult=2, eta_min=0,
+                                                                 last_epoch=-1)
+
+
+def convertBNtoGN(module, num_groups=16):
+    if isinstance(module, torch.nn.modules.batchnorm.BatchNorm2d):
+        return nn.GroupNorm(num_groups, module.num_features,
+                            eps=module.eps, affine=module.affine)
+        if module.affine:
+            mod.weight.data = module.weight.data.clone().detach()
+            mod.bias.data = module.bias.data.clone().detach()
+
+    for name, child in module.named_children():
+        module.add_module(name, convertBNtoGN(child, num_groups=num_groups))
+
+    return module
+
+
+if not use_unet:
+    net = convertBNtoGN(net)
 wandb.login(key='####')
-wandb.init(project="Sen1Floods11-unet", config={
-           "learning_rate": lr,
-           "batch_size": batch_size,
-           "num_workers": num_workers,
-           "depth":depth,
-           "num_first_level_channels": num_first_level_channels},
-           tags=['basic_test'])
+wandb_config = {"learning_rate": lr,
+                "batch_size": batch_size,
+                "num_workers": num_workers}
+
+if use_unet:
+    wandb_config.update({"depth": depth,
+                         "num_first_level_channels": num_first_level_channels,
+                         "model": "unet"})
+else:
+    wandb_config.update({"model": "fcn_resnet50"})
+
+if use_vv:
+    wandb_config.update({"training_data": "S1_vv_vh"})
+else:
+    wandb_config.update({"training_data": "S1_vh"})
+
+if dataset == "flood_hand-labeled":
+    wandb_config.update({"dataset": "flood_hand-labeled"})
+
+wandb.init(project="Sen1Floods11-unet", config=wandb_config, tags=['test'])
 
 
-# Define assessment metrics. For our purposes, we use overall accuracy and mean intersection over union. However, we also include functions for calculating true positives, false positives, true negatives, and false negatives.
+# Define assessment metrics. For our purposes, we use overall accuracy and mean intersection over union. However, we
+# also include functions for calculating true positives, false positives, true negatives, and false negatives.
 def computeIOU(output, target):
-  output = torch.argmax(output, dim=1).flatten() 
-  target = target.flatten()
-  
-  no_ignore = target.ne(255)
-  output = output.masked_select(no_ignore)
-  target = target.masked_select(no_ignore)
-  intersection = torch.sum(output * target)
-  union = torch.sum(target) + torch.sum(output) - intersection
-  iou = (intersection + .0000001) / (union + .0000001)
-  
-  if iou != iou:
-    print("failed, replacing with 0")
-    iou = torch.tensor(0).float()
-  
-  return iou
-  
+    output = torch.argmax(output, dim=1).flatten()
+    target = target.flatten()
+
+    no_ignore = target.ne(255).cuda()
+    output = output.masked_select(no_ignore)
+    target = target.masked_select(no_ignore)
+    intersection = torch.sum(output * target)
+    union = torch.sum(target) + torch.sum(output) - intersection
+    iou = (intersection + .0000001) / (union + .0000001)
+
+    if iou != iou:
+        print("failed, replacing with 0")
+        iou = torch.tensor(0).float()
+
+    return iou
+
+
 def computeAccuracy(output, target):
-  output = torch.argmax(output, dim=1).flatten() 
-  target = target.flatten()
-  
-  no_ignore = target.ne(255)
-  output = output.masked_select(no_ignore)
-  target = target.masked_select(no_ignore)
-  correct = torch.sum(output.eq(target))
-  
-  return correct.float() / len(target)
+    output = torch.argmax(output, dim=1).flatten()
+    target = target.flatten()
+
+    no_ignore = target.ne(255).cuda()
+    output = output.masked_select(no_ignore)
+    target = target.masked_select(no_ignore)
+    correct = torch.sum(output.eq(target))
+
+    return correct.float() / len(target)
+
 
 def truePositives(output, target):
-  output = torch.argmax(output, dim=1).flatten() 
-  target = target.flatten()
-  no_ignore = target.ne(255)
-  output = output.masked_select(no_ignore)
-  target = target.masked_select(no_ignore)
-  correct = torch.sum(output * target)
-  
-  return correct
+    output = torch.argmax(output, dim=1).flatten()
+    target = target.flatten()
+    no_ignore = target.ne(255).cuda()
+    output = output.masked_select(no_ignore)
+    target = target.masked_select(no_ignore)
+    correct = torch.sum(output * target)
+
+    return correct
+
 
 def trueNegatives(output, target):
-  output = torch.argmax(output, dim=1).flatten() 
-  target = target.flatten()
-  no_ignore = target.ne(255)
-  output = output.masked_select(no_ignore)
-  target = target.masked_select(no_ignore)
-  output = (output == 0)
-  target = (target == 0)
-  correct = torch.sum(output * target)
-  
-  return correct
+    output = torch.argmax(output, dim=1).flatten()
+    target = target.flatten()
+    no_ignore = target.ne(255).cuda()
+    output = output.masked_select(no_ignore)
+    target = target.masked_select(no_ignore)
+    output = (output == 0)
+    target = (target == 0)
+    correct = torch.sum(output * target)
+
+    return correct
+
 
 def falsePositives(output, target):
-  output = torch.argmax(output, dim=1).flatten() 
-  target = target.flatten()
-  no_ignore = target.ne(255)
-  output = output.masked_select(no_ignore)
-  target = target.masked_select(no_ignore)
-  output = (output == 1)
-  target = (target == 0)
-  correct = torch.sum(output * target)
-  
-  return correct
+    output = torch.argmax(output, dim=1).flatten()
+    target = target.flatten()
+    no_ignore = target.ne(255).cuda()
+    output = output.masked_select(no_ignore)
+    target = target.masked_select(no_ignore)
+    output = (output == 1)
+    target = (target == 0)
+    correct = torch.sum(output * target)
+
+    return correct
+
 
 def falseNegatives(output, target):
-  output = torch.argmax(output, dim=1).flatten() 
-  target = target.flatten()
-  no_ignore = target.ne(255)
-  output = output.masked_select(no_ignore)
-  target = target.masked_select(no_ignore)
-  output = (output == 0)
-  target = (target == 1)
-  correct = torch.sum(output * target)
-  
-  return correct
+    output = torch.argmax(output, dim=1).flatten()
+    target = target.flatten()
+    no_ignore = target.ne(255).cuda()
+    output = output.masked_select(no_ignore)
+    target = target.masked_select(no_ignore)
+    output = (output == 0)
+    target = (target == 1)
+    correct = torch.sum(output * target)
+
+    return correct
 
 
 # Define training loop
-
 training_losses = []
 training_accuracies = []
 training_ious = []
+
 
 def train_loop(inputs, labels, net, optimizer, scheduler):
     global running_loss
@@ -365,111 +491,197 @@ def train_loop(inputs, labels, net, optimizer, scheduler):
 
     # zero the parameter gradients
     optimizer.zero_grad()
-    net = net
+    net = net.cuda()
 
     # forward + backward + optimize
-    outputs = net(inputs)
-    loss = criterion(outputs, labels.long())
+    outputs = net(inputs.cuda())
+    loss = criterion(outputs["out"], labels.long().cuda())
     loss.backward()
     optimizer.step()
     scheduler.step()
 
-
-    running_loss += loss
-    running_iou += computeIOU(outputs, labels)
-    running_accuracy += computeAccuracy(outputs, labels)
+    running_loss += loss.detach().cpu().numpy()
+    running_iou += computeIOU(outputs["out"], labels.cuda()).detach().cpu().numpy()
+    running_accuracy += computeAccuracy(outputs["out"], labels.cuda()).detach().cpu().numpy()
     running_count += 1
-    train_loss = running_loss / running_count
-    train_iou = running_iou / running_count
-    train_accuracy = running_accuracy / running_count
-    print("Training Loss:", train_loss)
-    print("Training IOU:", train_iou)
-    print("Training Accuracy:", train_accuracy)
-    training_losses.append(train_loss.detach().numpy())
-    training_accuracies.append(train_accuracy.detach().numpy())
-    training_ious.append(train_iou.detach().numpy())
-    metrics = {
-        'train_loss': train_loss, 'train_iou': train_iou, 'train_acc': train_accuracy
-    }
-    return metrics
 
 
+# Define validation loop
 valid_losses = []
 valid_accuracies = []
 valid_ious = []
 
-def validation_loop(validation_data_loader, net, epoch):
-  global running_loss
-  global running_iou
-  global running_count
-  global running_accuracy
-  global max_valid_iou
 
-  global training_losses
-  global training_accuracies
-  global training_ious
-  global valid_losses
-  global valid_accuracies
-  global valid_ious
+def validation_loop(validation_data_loader, net, test_data_loader, bolivia_test_loader):
+    global running_loss
+    global running_iou
+    global running_count
+    global running_accuracy
+    global max_valid_iou
 
-  net = net.eval()
-  net = net
-  count = 0
-  iou = 0
-  loss = 0
-  accuracy = 0
-  with torch.no_grad():
-      for (images, labels) in validation_data_loader:
-          net = net
-          outputs = net(images)
-          valid_loss = criterion(outputs, labels.long())
-          valid_iou = computeIOU(outputs, labels)
-          valid_accuracy = computeAccuracy(outputs, labels)
-          iou += valid_iou
-          loss += valid_loss
-          accuracy += valid_accuracy
-          count += 1
+    global training_losses
+    global training_accuracies
+    global training_ious
+    global valid_losses
+    global valid_accuracies
+    global valid_ious
 
-  iou = iou / count
-  accuracy = accuracy / count
+    net = net.eval()
+    net = net.cuda()
+    count = 0
+    iou = 0
+    loss = 0
+    accuracy = 0
+    plot_images = True
+    with torch.no_grad():
+        for (images, labels) in validation_data_loader:
+            net = net.cuda()
+            outputs = net(images.cuda())
+            valid_loss = criterion(outputs["out"], labels.long().cuda())
+            valid_iou = computeIOU(outputs["out"], labels.cuda())
+            valid_accuracy = computeAccuracy(outputs["out"], labels.cuda())
+            iou += valid_iou.cpu().numpy()
+            loss += valid_loss.cpu().numpy()
+            accuracy += valid_accuracy.cpu().numpy()
+            count += 1
+            if plot_images:
+                plot_images = False
+                images = unnorm(images).cpu().numpy()
+                true_segs = labels.cpu().numpy().astype(float)
+                true_segs[true_segs == 255.] = 0.5
+                model_segs = np.argmax(outputs["out"].detach().cpu().numpy(), axis=1)
+                fig, axs = plt.subplots(4, 10, figsize=(15, 8))
+                cmap = ListedColormap(["lawngreen", "white", "blue"])
+                for i in range(10):
+                    image = np.transpose(images[i], [1, 2, 0])
+                    true_seg = true_segs[i]
+                    model_seg = model_segs[i]
+                    axs[0, i].imshow(image[:, :, :1], cmap='gray', vmin=0., vmax=1., interpolation='none')
+                    axs[0, i].axis('off')
+                    axs[1, i].imshow(image[:, :, 1:], cmap='gray', vmin=0., vmax=1., interpolation='none')
+                    axs[1, i].axis('off')
+                    #                   axs[0, i].set_title('Image')
+                    axs[2, i].imshow(true_seg, cmap=cmap, vmin=0., vmax=1., interpolation='none')
+                    axs[2, i].axis('off')
+                    #                   axs[1, i].set_title('True segmentation map')
+                    axs[3, i].imshow(model_seg, cmap=cmap, vmin=0., vmax=1., interpolation='none')
+                    axs[3, i].axis('off')
+                    #                   axs[2, i].set_title('Predicted segmentation map')
+                fig.tight_layout()
+                fig.canvas.draw()
+                wandb_fig = plt.gcf()
+                wandb_img = wandb.Image(fig2img(wandb_fig))
 
-  if iou > max_valid_iou:
-    max_valid_iou = iou
-    save_path = os.path.join("checkpoints", "Sen1Floods11_{}_{}.cp".format(epoch, iou.item()))
-    torch.save(net.state_dict(), save_path)
-    print("model saved at", save_path)
+    iou = iou / count
+    accuracy = accuracy / count
 
-  loss = loss / count
-  print("Training Loss:", running_loss / running_count)
-  print("Training IOU:", running_iou / running_count)
-  print("Training Accuracy:", running_accuracy / running_count)
-  print("Validation Loss:", loss)
-  print("Validation IOU:", iou)
-  print("Validation Accuracy:", accuracy)
+    loss = loss / count
+    print("Training Loss:", running_loss / running_count)
+    print("Training IOU:", running_iou / running_count)
+    print("Training Accuracy:", running_accuracy / running_count)
+    print("Validation Loss:", loss)
+    print("Validation IOU:", iou)
+    print("Validation Accuracy:", accuracy)
+
+    if iou > max_valid_iou:
+        max_valid_iou = iou
+        save_path = os.path.join("checkpoints", "{}_{}_{}.cp".format(runname, dataset, wandb.run.name))
+        torch.save(net.state_dict(), save_path)
+        print("model saved at", save_path)
+        print("General test dataset:")
+        test_metrics = test_loop(iter(test_data_loader), net)
+        print("Bolivia test dataset:")
+        bolivia_test_metrics = test_loop(iter(bolivia_test_loader), net)
+        metrics = {'train_loss': running_loss / running_count, 'train_iou': running_iou / running_count,
+                   'train_acc': running_accuracy / running_count, 'valid_loss': loss, 'valid_iou': iou,
+                   'valid_acc': accuracy, 'val_example': wandb_img, **test_metrics, **bolivia_test_metrics}
+    else:
+        metrics = {'train_loss': running_loss / running_count, 'train_iou': running_iou / running_count,
+                   'train_acc': running_accuracy / running_count, 'valid_loss': loss, 'valid_iou': iou,
+                   'valid_acc': accuracy, 'val_example': wandb_img}
+
+    training_losses.append(running_loss / running_count)
+    training_accuracies.append(running_accuracy / running_count)
+    training_ious.append(running_iou / running_count)
+    valid_losses.append(loss)
+    valid_accuracies.append(accuracy)
+    valid_ious.append(iou)
+
+    wandb.log(metrics)
 
 
-  training_losses.append((running_loss / running_count).detach().numpy())
-  training_accuracies.append((running_accuracy / running_count).detach().numpy())
-  training_ious.append((running_iou / running_count).detach().numpy())
-  valid_losses.append(loss.detach().numpy())
-  valid_accuracies.append(accuracy.detach().numpy())
-  valid_ious.append(iou.detach().numpy())
+# Define testing loop (here, you can replace assessment metrics).
+def test_loop(test_data_loader, net):
+    net = net.eval()
+    net = net.cuda()
+    count = 0
+    iou = 0
+    loss = 0
+    accuracy = 0
+    with torch.no_grad():
+        for (images, labels) in test_data_loader:
+            net = net.cuda()
+            outputs = net(images.cuda())
+            valid_loss = criterion(outputs["out"], labels.long().cuda())
+            valid_iou = computeIOU(outputs["out"], labels.cuda())
+            iou += valid_iou.cpu().numpy()
+            accuracy += computeAccuracy(outputs["out"], labels.cuda()).cpu().numpy()
+            count += 1
 
+    iou = iou / count
+    print("Test IOU:", iou)
+    print("Test Accuracy:", accuracy / count)
+
+    test_metrics = {'test_iou': iou, 'test_acc': accuracy / count}
+
+    return test_metrics
+
+
+# Define training and validation scheme
+from tqdm import tqdm
 
 running_loss = 0
 running_iou = 0
 running_count = 0
 running_accuracy = 0
 
+training_losses = []
+training_accuracies = []
+training_ious = []
+valid_losses = []
+valid_accuracies = []
+valid_ious = []
 
 
 def train_epoch(net, optimizer, scheduler, train_iter):
-  for (inputs, labels) in tqdm(train_iter):
-    train_metrics = train_loop(inputs, labels, net, optimizer, scheduler)
-  return train_metrics
+    for (inputs, labels) in train_iter:
+        train_loop(inputs.cuda(), labels.cuda(), net.cuda(), optimizer, scheduler)
+
+
+def train_validation_loop(net, optimizer, scheduler, train_loader,
+                          valid_loader, num_epochs, cur_epoch, test_loader, bolivia_test_loader):
+    global running_loss
+    global running_iou
+    global running_count
+    global running_accuracy
+    net = net.train()
+    running_loss = 0
+    running_iou = 0
+    running_count = 0
+    running_accuracy = 0
+
+    for i in range(num_epochs):
+        train_iter = iter(train_loader)
+        train_epoch(net, optimizer, scheduler, train_iter)
+
+    print("Current Epoch:", cur_epoch)
+    validation_loop(iter(valid_loader), net, iter(test_loader), iter(bolivia_test_loader))
 
 
 # Train model and assess metrics over epochs
+import os
+import matplotlib.pyplot as plt
+
 max_valid_iou = 0
 
 epochs = []
@@ -480,29 +692,9 @@ valid_losses = []
 valid_accuracies = []
 valid_ious = []
 
-for epoch in range(1000):
-    model = model.train()
-    running_loss = 0
-    running_iou = 0
-    running_count = 0
-    running_accuracy = 0
-  
-    train_iter = iter(train_loader)
-    train_metrics = train_epoch(model, optimizer, scheduler, train_iter)
-    print("Current Epoch:", epoch)
-    val_metrics = validation_loop(iter(valid_loader), model, epoch)
-    epochs.append(epoch)
+for i in range(max_epochs):
+    train_validation_loop(net, optimizer, scheduler, train_loader, valid_loader, 10, 10 * i, test_loader,
+                          bolivia_test_loader)
+    epochs.append(i)
     x = epochs
-    plt.plot(x, training_losses, label='training losses')
-    plt.plot(x, training_accuracies, 'tab:orange', label='training accuracy')
-    plt.plot(x, training_ious, 'tab:purple', label='training iou')
-    plt.plot(x, valid_losses, label='valid losses')
-    plt.plot(x, valid_accuracies, 'tab:red',label='valid accuracy')
-    plt.plot(x, valid_ious, 'tab:green',label='valid iou')
-    plt.legend(loc="upper left")
-    # plt.show()
-
     print("max valid iou:", max_valid_iou)
-    metrics = {**train_metrics,  **val_metrics}
-    wandb.log(metrics)
-
