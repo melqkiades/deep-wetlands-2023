@@ -38,7 +38,7 @@ import os
 import random
 import numpy as np
 from torchmetrics.classification import BinaryJaccardIndex
-from PIL import Image
+from PIL import Image, ImageFile
 from torch.utils.data import Dataset
 import matplotlib.pyplot as plt
 
