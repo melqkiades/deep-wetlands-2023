@@ -103,7 +103,7 @@ def processTestIm(data, use_vv=False):
     if use_vv:
         norm = transforms.Normalize([0.6851, 0.5235], [0.0820, 0.1102])
     else:
-        transforms.Normalize([0.5235], [0.1102])
+        norm = transforms.Normalize([0.5235], [0.1102])
 
     # convert to PIL for easier transforms
     if use_vv:

@@ -11,7 +11,7 @@ runname = "Sen1Floods11_unsup"
 use_vv = False
 dataset = "flood_hand-labeled"
 batch_size = 8
-num_workers = 0
+num_workers = 8
 
 # Define functions to process and augment training and testing images
 import torch
@@ -86,14 +86,12 @@ def processAndAugment_unsupervised(data, use_vv=False):
     im_aug = transforms.GaussianBlur(5, sigma=(0.1, 2.0))(im)
     im = norm(im)
     im_aug = norm(im_aug)
-    randomShufflingIndices = torch.randperm(im_aug.shape[0])
-    im_shuffled = im_aug[randomShufflingIndices, :, :, :]
     label = transforms.ToTensor()(label).squeeze()
     if torch.sum(label.gt(.003) * label.lt(.004)):
         label *= 255
 #   label = label.round()
 
-    return im, im_aug, im_shuffled, label
+    return im, im_aug, label
 
 
 def processTestIm(data, use_vv=False):
@@ -102,7 +100,7 @@ def processTestIm(data, use_vv=False):
     if use_vv:
         norm = transforms.Normalize([0.6851, 0.5235], [0.0820, 0.1102])
     else:
-        transforms.Normalize([0.5235], [0.1102])
+        norm = transforms.Normalize([0.5235], [0.1102])
 
     # convert to PIL for easier transforms
     if use_vv:
@@ -360,16 +358,16 @@ else:
 num_output_channels = 2
 num_first_level_channels = 64
 depth = 4
+K = 12
 
 net = Unet(input_dim, num_input_channels, num_output_channels, num_first_level_channels, depth, padding=True,
            conv_init="He", head=False)
 net_aug = Unet(input_dim, num_input_channels, num_output_channels, num_first_level_channels, depth, padding=True,
                conv_init="He", head=False)
-prediction_module = Prediction_Module(num_input_channels, num_output_channels, conv_init="He")
+prediction_module = Prediction_Module(num_first_level_channels, K, conv_init="He")
 
 deep_clustering_loss_func = nn.CrossEntropyLoss()
 similarity_loss_func = nn.L1Loss()
-criterion = nn.CrossEntropyLoss(weight=torch.tensor([1,8]).float().cuda(), ignore_index=255)
 optimizer = torch.optim.AdamW(list(net.parameters()) + list(net_aug.parameters()) + list(prediction_module.parameters()),
                               lr=lr)
 scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, len(train_loader) * 10, T_mult=2, eta_min=0,
@@ -476,8 +474,12 @@ training_losses = []
 training_accuracies = []
 training_ious = []
 
-def train_loop(inputs, inputs_aug, inputs_shuffled, labels, net, net_aug, projector, optimizer, scheduler):
+def train_loop(inputs, inputs_aug, net, net_aug, prediction_module, optimizer, scheduler, epoch_num):
     global running_loss
+    global running_deep_clustering_loss
+    global running_deep_clustering_loss_aug
+    global running_similarity_loss
+    global running_disimilarity_loss
     global running_iou
     global running_count
     global running_accuracy
@@ -486,15 +488,17 @@ def train_loop(inputs, inputs_aug, inputs_shuffled, labels, net, net_aug, projec
     optimizer.zero_grad()
     net = net.cuda()
     net_aug = net_aug.cuda()
-    projector = projector.cuda()
+    prediction_module = prediction_module.cuda()
 
     # forward + backward + optimize
+    randomShufflingIndices = torch.randperm(inputs_aug.shape[0])
+    inputs_shuffled = inputs_aug[randomShufflingIndices, :, :, :]
     outputs = net(inputs.cuda())
-    projections = projector(outputs)
+    projections = prediction_module(outputs)
     outputs_aug = net_aug(inputs_aug.cuda())
-    projections_aug = projector(outputs_aug)
+    projections_aug = prediction_module(outputs_aug)
     outputs_shuffled = net_aug(inputs_shuffled.cuda())
-    projections_shuffled = projector(outputs_shuffled)
+    projections_shuffled = prediction_module(outputs_shuffled)
 
     _, predictions = torch.max(projections, 1)
     _, predictions_aug = torch.max(projections_aug, 1)
@@ -503,14 +507,21 @@ def train_loop(inputs, inputs_aug, inputs_shuffled, labels, net, net_aug, projec
     deep_clustering_loss_aug = deep_clustering_loss_func(projections_aug, predictions_aug)
     similarity_loss = similarity_loss_func(projections, projections_aug)
     disimilarity_loss = -similarity_loss_func(projections, projections_shuffled)
-    loss = (deep_clustering_loss + deep_clustering_loss_aug + similarity_loss + disimilarity_loss)/4
+    if epoch_num <50:
+        loss = (deep_clustering_loss + deep_clustering_loss_aug)/2
+    else:
+        loss = (deep_clustering_loss + deep_clustering_loss_aug + similarity_loss + disimilarity_loss) / 4
     loss.backward()
     optimizer.step()
     scheduler.step()
 
     running_loss += loss.detach().cpu().numpy()
-    running_iou += computeIOU(outputs, labels.cuda()).detach().cpu().numpy()
-    running_accuracy += computeAccuracy(outputs, labels.cuda()).detach().cpu().numpy()
+    running_deep_clustering_loss += deep_clustering_loss.detach().cpu().numpy()
+    running_deep_clustering_loss_aug += deep_clustering_loss_aug.detach().cpu().numpy()
+    running_similarity_loss += similarity_loss.detach().cpu().numpy()
+    running_disimilarity_loss += disimilarity_loss.detach().cpu().numpy()
+    # running_iou += computeIOU(outputs, labels).detach().numpy()
+    # running_accuracy += computeAccuracy(outputs, labels).detach().numpy()
     running_count += 1
 
 
@@ -644,9 +655,11 @@ valid_ious = []
 
 
 # Define training and validation scheme
-from tqdm import tqdm
-
 running_loss = 0
+running_deep_clustering_loss = 0
+running_deep_clustering_loss_aug = 0
+running_similarity_loss = 0
+running_disimilarity_loss = 0
 running_iou = 0
 running_count = 0
 running_accuracy = 0
@@ -659,26 +672,42 @@ valid_accuracies = []
 valid_ious = []
 
 
-def train_epoch(net, net_aug, projector, optimizer, scheduler, train_iter):
-    for (inputs, inputs_aug, inputs_shuffled, labels) in train_iter:
-        train_loop(inputs, inputs_aug, inputs_shuffled, labels, net, net_aug, projector, optimizer, scheduler)
+def train_epoch(net, net_aug, prediction_module, optimizer, scheduler, train_iter, epoch_num):
+    for (inputs, inputs_aug, labels) in train_iter:
+        train_loop(inputs, inputs_aug, net, net_aug, prediction_module, optimizer, scheduler, epoch_num)
  
 
 def train_validation_loop(net, net_aug, prediction_module, optimizer, scheduler, train_loader,
                           valid_loader, num_epochs, cur_epoch, test_loader, bolivia_test_loader):
     global running_loss
+    global running_deep_clustering_loss
+    global running_deep_clustering_loss_aug
+    global running_similarity_loss
+    global running_disimilarity_loss
     global running_iou
     global running_count
     global running_accuracy
     net = net.train()
     running_loss = 0
+    running_deep_clustering_loss = 0
+    running_deep_clustering_loss_aug = 0
+    running_similarity_loss = 0
+    running_disimilarity_loss = 0
     running_iou = 0
     running_count = 0
     running_accuracy = 0
 
     for i in range(num_epochs):
         train_iter = iter(train_loader)
-        train_epoch(net, net_aug, projector, optimizer, scheduler, train_iter)
+        train_epoch(net, net_aug, prediction_module, optimizer, scheduler, train_iter, cur_epoch+i+1)
+
+        metrics = {'train_loss': running_loss / running_count,
+                   'train_deep_clustering_loss': running_deep_clustering_loss / running_count,
+                   'train_deep_clustering_loss_aug': running_deep_clustering_loss_aug / running_count,
+                   'train_similarity_loss': running_similarity_loss / running_count,
+                   'train_disimilarity_loss': running_disimilarity_loss / running_count}  # , 'clustering_example': wandb_img}
+
+        wandb.log(metrics)
 
     print("Current Epoch:", cur_epoch)
     # validation_loop(iter(valid_loader), net, net_aug, projector, iter(test_loader), iter(bolivia_test_loader))
@@ -699,7 +728,16 @@ valid_accuracies = []
 valid_ious = []
 
 for i in range(max_epochs):
-    train_validation_loop(net, net_aug, prediction_module, optimizer, scheduler, train_loader, valid_loader, 10, 10*i, test_loader, bolivia_test_loader)
+    train_validation_loop(net, net_aug, prediction_module, optimizer, scheduler, train_loader, valid_loader, 50, 50*i, test_loader, bolivia_test_loader)
     epochs.append(i)
     x = epochs
     # print("max valid iou:", max_valid_iou)
+    if i*50%200 == 0:
+        save_path = os.path.join("checkpoints", "unsupervised_{}_{}_{}_{}.cp".format(runname, dataset, wandb.run.name, i*50))
+        torch.save(net.state_dict(), save_path)
+        save_path = os.path.join("checkpoints",
+                                 "unsupervised_aug_{}_{}_{}_{}.cp".format(runname, dataset, wandb.run.name, i * 50))
+        torch.save(net_aug.state_dict(), save_path)
+        save_path = os.path.join("checkpoints",
+                                 "unsupervised_pred_{}_{}_{}_{}.cp".format(runname, dataset, wandb.run.name, i * 50))
+        torch.save(prediction_module.state_dict(), save_path)
