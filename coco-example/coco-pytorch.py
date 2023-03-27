@@ -16,7 +16,7 @@ class Unet(nn.Module):
 
     def __init__(self, input_dim=572, num_input_channels=4, num_output_channels=2, num_first_level_channels=64,
                 depth=5, conv_kernel_size=3, conv_stride=1, max_pool_size=2,
-                up_conv_kernel_size=2, up_conv_stride=2, padding=False):
+                up_conv_kernel_size=2, up_conv_stride=2, padding=False, conv_init=None):
         super().__init__()
 
         self.input_dim = input_dim
@@ -30,6 +30,7 @@ class Unet(nn.Module):
         self.up_conv_kernel_size = up_conv_kernel_size
         self.up_conv_stride = up_conv_stride
         self.padding = padding
+        self.conv_init = conv_init
         self.depth_num_channels = [self.num_first_level_channels]
         for i in range(self.depth-1):
             self.depth_num_channels.append(self.depth_num_channels[-1]*2)
@@ -77,7 +78,7 @@ class Unet(nn.Module):
             x = self.decoder_layers[i](x)
             x = torch.cat([skip_connections[i // 2], x], 1)
             x = self.decoder_layers[i + 1](x)
-        x = torch.nn.Softmax(dim=1)(self.final_layer(x))
+        x = torch.sigmoid(self.final_layer(x))
 
         return x
 
@@ -86,8 +87,11 @@ class Unet(nn.Module):
             padding_arg = 'valid'
         else:
             padding_arg = 'same'
-        conv_block = nn.Sequential(nn.Conv2d(num_in_channels, num_out_channels, self.conv_kernel_size, self.conv_stride,
-                                             padding=padding_arg),
+        conv_layer = nn.Conv2d(num_in_channels, num_out_channels, self.conv_kernel_size, self.conv_stride,
+                                             padding=padding_arg)
+        if self.conv_init == 'He':
+            torch.nn.init.kaiming_uniform_(conv_layer.weight)
+        conv_block = nn.Sequential(conv_layer,
                                    nn.BatchNorm2d(num_out_channels),
                                    nn.ReLU())
         return conv_block
@@ -132,6 +136,22 @@ def fig2img(fig):
     img = Image.open(buf)
     return img
 
+invTrans = transforms.Compose([ transforms.Normalize(mean = [ 0., 0., 0. ],
+                                                     std = [ 1/0.229, 1/0.224, 1/0.225 ]),
+                                transforms.Normalize(mean = [ -0.485, -0.456, -0.406 ],
+                                                     std = [ 1., 1., 1. ]),
+                               ])
+
+input_dim = 256
+num_input_channels = 3
+num_output_channels = 1
+batch_size = 16
+num_workers = 8
+
+
+random_crop = transforms.RandomResizedCrop(256)
+normalization = transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+
 
 def get_mask(image, annotation, coco_annotations, augment):
     image = transforms.ToTensor()(image)
@@ -151,23 +171,8 @@ def get_mask(image, annotation, coco_annotations, augment):
     return image, mask
 
 
-invTrans = transforms.Compose([ transforms.Normalize(mean = [ 0., 0., 0. ],
-                                                     std = [ 1/0.229, 1/0.224, 1/0.225 ]),
-                                transforms.Normalize(mean = [ -0.485, -0.456, -0.406 ],
-                                                     std = [ 1., 1., 1. ]),
-                               ])
-
-input_dim = 256
-num_input_channels = 3
-num_output_channels = 1
-batch_size = 32
-num_workers = 8
-
 coco_train = COCO("/mimer/NOBACKUP/Datasets/Microsoft-COCO/annotations/instances_train2017.json")
 coco_val = COCO("/mimer/NOBACKUP/Datasets/Microsoft-COCO/annotations/instances_val2017.json")
-
-random_crop = transforms.RandomResizedCrop(256)
-normalization = transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
 
 datasets = {'train':datasets.CocoDetection("/mimer/NOBACKUP/Datasets/Microsoft-COCO/train2017",
                                  "/mimer/NOBACKUP/Datasets/Microsoft-COCO/annotations/instances_train2017.json",transforms=partial(get_mask, coco_annotations=coco_train, augment=True)),
@@ -268,7 +273,9 @@ def evaluate(model, dataloader, criterion, device, plot_result=True):
 wandb.login(key='####')
 num_first_level_channels = 64
 depth = 4
-model = Unet(input_dim, num_input_channels, num_output_channels, num_first_level_channels, depth, padding=True)
+# conv_init = "He"
+conv_init = None
+model = Unet(input_dim, num_input_channels, num_output_channels, num_first_level_channels, depth, padding=True, conv_init=conv_init)
 model.to(device)
 lr = 0.0004863
 weight_decay = 0.0003204
@@ -282,7 +289,8 @@ wandb.init(project="coco-unet", config={
         "batch_size": batch_size,
         "num_workers": num_workers,
         "depth":depth,
-    })
+        "conv_init":conv_init,
+        "num_first_level_channels":num_first_level_channels})
 n_epochs = 100
 for epoch in range(1, n_epochs + 1):
     starttime = time()
