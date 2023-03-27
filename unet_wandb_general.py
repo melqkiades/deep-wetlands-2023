@@ -386,8 +386,8 @@ class DoubleConv(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(out_channels, out_channels, 3, 1, 1, bias=False),
             nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True,
-            nn.Dropout(p=0.2)
+            nn.ReLU(inplace=True
+            #nn.Dropout(p=0.2)
         )
 
     def forward(self, x):
@@ -452,7 +452,7 @@ def test():
 test()
 
 #TRAIN U-NET
-def train_fn(loader, model, optimizer, loss_fn, scaler, epoch):
+def train_fn(loader, model, optimizer, loss_fn, scaler, epoch, scheduler):
 
     #wandb.watch(model, loss_fn, log="all", log_freq=10)
 
@@ -478,7 +478,10 @@ def train_fn(loader, model, optimizer, loss_fn, scaler, epoch):
         # update tqdm loop
         loop.set_postfix(loss=loss.item())
 
-    return loss
+    scheduler.step()
+    lr = scheduler.get_lr()
+
+    return loss, lr
 
 # Hyperparameters etc.
 LEARNING_RATE = 1e-4
@@ -496,6 +499,7 @@ VAL_IMG_DIR = "ETCI/val_images/" # "data/val_images/"
 VAL_MASK_DIR = "ETCI/val_masks/" # "data/val_masks/"
 TEST_IMG_DIR = "ETCI/test_images/" # "data/test_images/"
 TEST_MASK_DIR = "ETCI/test_masks/" # "data/test_masks/"
+REG = "Annealing"
 
 def main():
 
@@ -507,6 +511,7 @@ def main():
     epochs= NUM_EPOCHS,
     batch_size= BATCH_SIZE,
     learning_rate= LEARNING_RATE,
+    regularization = REG,
     #dataset="Carvana",
     dataset="ETCI",
     architecture="U-NET",
@@ -562,6 +567,10 @@ def main():
         PIN_MEMORY,
     )
 
+  T_max = len(train_loader)
+  scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max)
+
+
   if LOAD_MODEL:
     load_checkpoint(torch.load("my_checkpoint.pth.tar"), model)
 
@@ -580,8 +589,10 @@ def main():
   Val_A = []
   Val_I = []
 
+  #l_rate = []
+
   for epoch in range(NUM_EPOCHS):
-    train_loss = train_fn(train_loader, model, optimizer, loss_fn, scaler, epoch)
+    train_loss, lr = train_fn(train_loader, model, optimizer, loss_fn, scaler, epoch, scheduler)
     train_acc, train_dice, train_IoU = check_accuracy(train_loader, model, device=DEVICE)
 
     #checkpoint = {
@@ -609,9 +620,11 @@ def main():
     Val_A.append(val_acc)
     Val_I.append(val_IoU)
 
+    #l_rate.append(lr)
+
     wandb.log({"Predicted_Mask": image_out,"Ground Truth": image_in, "Input_Image": original,
                "Train_Loss": train_loss, "Train_Acc": train_acc, "Train_IoU": train_IoU,
-               "Val_Loss": val_loss, "Val_Acc": val_acc, "Val_IoU": val_IoU,
+               "Val_Loss": val_loss, "Val_Acc": val_acc, "Val_IoU": val_IoU, "Learning_Rate": lr,
                "epoch": epoch})
 
     # save model every 20 epoch
