@@ -42,6 +42,11 @@ from PIL import Image, ImageFile
 from torch.utils.data import Dataset
 import matplotlib.pyplot as plt
 
+from torchvision.datasets import ImageFolder
+from torch.utils.data import Subset
+from sklearn.model_selection import train_test_split
+from torchvision.transforms import Compose, ToTensor, Resize
+
 #Solution to corrupted png file, source:https://github.com/python-pillow/Pillow/issues/5631
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -53,8 +58,8 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 def split_dataset(dataset, split=0.5):
     val_idx, test_idx = train_test_split(list(range(len(dataset))), test_size= split)
     datasets = {}
-    datasets['val'] = Subset(dataset, val_idx)
-    datasets['test'] = Subset(dataset, test_idx)
+    datasets['train'] = Subset(dataset, val_idx)
+    datasets['val'] = Subset(dataset, test_idx)
     return datasets
 
 """dataset = ImageFolder('C:\Datasets\lcms-dataset', transform=Compose([Resize((224,224)),ToTensor()]))
@@ -229,8 +234,17 @@ def get_loaders(
         transform=train_transform,
     )
 
+    dsets = split_dataset(train_ds, split=0.2)
+    t_ds = dsets['train']
+    v_ds = dsets['val']
+
+    #print (len(train_ds))
+    #print("train", len(t_ds))
+    #print("val", len(v_ds))
+
     train_loader = DataLoader(
-        train_ds,
+        #train_ds,
+        t_ds
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
@@ -238,14 +252,15 @@ def get_loaders(
     )
 
     #val_ds = CarvanaDataset(
-    val_ds = ETCI(
-        image_dir=val_dir,
-        mask_dir=val_maskdir,
-        transform=val_transform,
-    )
+#    val_ds = ETCI(
+#        image_dir=val_dir,
+#        mask_dir=val_maskdir,
+#        transform=val_transform,
+#    )
 
     val_loader = DataLoader(
-        val_ds,
+        #val_ds,
+        v_ds,
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
@@ -348,33 +363,34 @@ def save_predictions_as_imgs(
           for id, img in enumerate(preds[len(preds)-5:,:,:,:]):
             axarr[id].imshow(img.permute(1, 2, 0).numpy(force=True))
           f.tight_layout(pad=0.5)
-          f.savefig(f'{folder}/pred_{idx}.png')
+          #f.savefig(f'{folder}/pred_{idx}.png')
 
 
           f2, axr = plt.subplots(1,5)
           for id, img in enumerate(y.unsqueeze(1)[len(preds)-5:,:,:,:]):
             axr[id].imshow(img.permute(1, 2, 0).numpy(force=True))
           f2.tight_layout(pad=0.5)
-          f2.savefig(f'{folder}/{idx}.png')
+          #f2.savefig(f'{folder}/{idx}.png')
 
           f3, axo = plt.subplots(1,5)
           for id, img in enumerate(x[len(preds)-5:,:,:,:]):
             axo[id].imshow(img.permute(1, 2, 0).numpy(force=True))
           f3.tight_layout(pad=0.5)
-          f3.savefig(f'{folder}/orig_{idx}.png')
+          #f3.savefig(f'{folder}/orig_{idx}.png')
 
-          out_path = os.path.join(folder,"pred_"+str(idx)+".png")
-          out_img = Image.open(out_path)
+          #out_path = os.path.join(folder,"pred_"+str(idx)+".png")
+          #out_img = Image.open(out_path)
 
-          in_path = os.path.join(folder,str(idx)+".png")
-          in_img = Image.open(in_path)
+          #in_path = os.path.join(folder,str(idx)+".png")
+          #in_img = Image.open(in_path)
 
-          orig_path = os.path.join(folder,"orig_"+str(idx)+".png")
-          orig = Image.open(orig_path)
+          #orig_path = os.path.join(folder,"orig_"+str(idx)+".png")
+          #orig = Image.open(orig_path)
 
     model.train()
 
-    return out_img, in_img, orig
+    #return out_img, in_img, orig
+    return f, f2, f3
 
 # BUILDING UNET MODEl (Source: https://www.classcentral.com/course/youtube-pytorch-image-segmentation-tutorial-with-u-net-everything-from-scratch-baby-126811)
 class DoubleConv(nn.Module):
@@ -486,7 +502,7 @@ def train_fn(loader, model, optimizer, loss_fn, scaler, epoch, scheduler):
 # Hyperparameters etc.
 LEARNING_RATE = 1e-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE =18 # C 16
+BATCH_SIZE =22 #18 # C 16
 NUM_EPOCHS = 3
 NUM_WORKERS = 2
 IMAGE_HEIGHT = 256 # C 160  # 1280 originally
@@ -568,7 +584,13 @@ def main():
     )
 
   T_max = len(train_loader)
-  scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max)
+  #T_0 = int(T_max/4)
+  #scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max)
+  #scheduler = optim.lr_scheduler.LinearLR(optimizer, start_factor=1, end_factor=1.0, total_iters=T_max, last_epoch=- 1, verbose=False)
+  scheduler = CosineAnnealingWarmRestarts(optimizer,
+                                        T_0 = 8,# Number of iterations for the first restart
+                                        T_mult = 1, # A factor increases TiTi​ after a restart
+                                        eta_min = LEARNING_RATE) # Minimum learning rate
 
 
   if LOAD_MODEL:
