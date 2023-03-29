@@ -234,9 +234,22 @@ def get_loaders(
         transform=train_transform,
     )
 
-    dsets = split_dataset(train_ds, split=0.2)
-    t_ds = dsets['train']
-    v_ds = dsets['val']
+    dsets = split_dataset(train_ds, split=0.15)
+
+    #val_ds = CarvanaDataset(
+    val_ds = ETCI(
+        image_dir=val_dir,
+        mask_dir=val_maskdir,
+        transform=val_transform,
+    )
+
+    dsets_2 = split_dataset(val_ds, split=0.15)
+
+    #t_ds = dsets['train']
+    #v_ds = dsets['val']
+
+    t_ds = torch.utils.data.ConcatDataset([dsets['train'], dsets_2 ['train']])
+    v_ds = torch.utils.data.ConcatDataset([dsets['val'], dsets_2 ['val']])
 
     #print (len(train_ds))
     #print("train", len(t_ds))
@@ -502,7 +515,7 @@ def train_fn(loader, model, optimizer, loss_fn, scaler, epoch, scheduler):
 # Hyperparameters etc.
 LEARNING_RATE = 1e-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE =22 #18 # C 16
+BATCH_SIZE =15# mixed #22 1_R #18 2_R # C 16
 NUM_EPOCHS = 3
 NUM_WORKERS = 2
 IMAGE_HEIGHT = 256 # C 160  # 1280 originally
@@ -590,7 +603,8 @@ def main():
   scheduler = CosineAnnealingWarmRestarts(optimizer,
                                         T_0 = 8,# Number of iterations for the first restart
                                         T_mult = 1, # A factor increases TiTi​ after a restart
-                                        eta_min = LEARNING_RATE) # Minimum learning rate
+                                        #eta_min = LEARNING_RATE) # Minimum learning rate
+                                        )
 
 
   if LOAD_MODEL:
