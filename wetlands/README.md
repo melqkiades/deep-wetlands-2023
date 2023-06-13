@@ -1,0 +1,2 @@
+# Wetlands unsupervised segmentation
+Code for performing unsupervised segmentation of water from SAR images based on the paper "Unsupervised Single-Scene Semantic Segmentation for Earth Observation" (https://ieeexplore.ieee.org/abstract/document/9773162)
